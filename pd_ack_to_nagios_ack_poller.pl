@@ -39,6 +39,14 @@ use JSON;
 use Data::Dumper;
 use strict;
 use Scalar::Util qw(looks_like_number);
+use Log::Log4perl qw(:easy);
+
+Log::Log4perl->easy_init(
+        {
+        level => $INFO,
+        file => ">> info_log",
+        }
+);
 
 my(%opts);
 my(@opts)=('debug',
@@ -46,7 +54,7 @@ my(@opts)=('debug',
            'nagios_command_pipe|c=s',
            'pagerduty_token|p=s',
            'pagerduty_service|n=s',
-           'days_back|t=s',
+           'hours_back|t=s',
            'help|h',
     );
 
@@ -63,7 +71,7 @@ options:
  --nagios_command_pipe <_file> | -c <_file> (default /var/spool/nagios/cmd/nagios.cmd)
  --pagerduty_token <_token> | -p <_token>
  --pagerduty_service <_service> | -n <_service> (limit to a comma separated list of service ids)
- --days_back <_days> | -t <_service> (the amount of time in days in the past to look for Nagios incidents - default and minimum value is 1)
+ --hours_back <_hours> | -t <_hours> (the amount of time in hours in the past to look for Nagios incidents - default and minimum value is 1)
  --help | -h (this message)
 EOT
 exit 0;
@@ -71,18 +79,20 @@ exit 0;
 
 $opts{nagios_status_file} ||= '/var/cache/nagios/status.dat';
 $opts{nagios_command_pipe} ||= '/var/spool/nagios/cmd/nagios.cmd';
-$opts{days_back} ||= '1';
+$opts{hours_back} ||= '1';
 
 die "can't access pipe $opts{nagios_command_pipe}" if(!(-w $opts{nagios_command_pipe}));
 die "--pagerduty_token|-p required" unless($opts{pagerduty_token});
-die "days back must be an integer greater than zero" unless(looks_like_number($opts{days_back}));
+die "hours back must be an integer greater than zero" unless(looks_like_number($opts{hours_back}));
 
-my($days_back) = int($opts{days_back});
+my($hours_back) = int($opts{hours_back});
+
+INFO("Options: -s =>$opts{nagios_status_file}, -c => $opts{nagios_command_pipe}, -n $opts{pagerduty_service}, -t => $opts{hours_back}");
 
 # optionally specify service id(s)
 my($svcparam) = "";
 if(defined($opts{pagerduty_service})){
-    $svcparam = "&service=$opts{pagerduty_service}";
+    $svcparam = "&service_ids%5B%5D=$opts{pagerduty_service}";
 }
 
 my($cmd);
@@ -136,7 +146,7 @@ print "All Nagios Hosts and Services with issues and issue number:\n" if($opts{d
 print Dumper $nagstat if($opts{debug});
 print "----------------\n\n" if($opts{debug});
 
-my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = gmtime(time - (86400 * $days_back));
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = gmtime(time - (3600 * $hours_back));
 $mon += 1;
 $year += 1900;
 my($dateforquery) = sprintf("%04d-%02d-%02dT%02d:%02d:%02dZ", $year, $mon, $mday, $hour, $min, $sec);
@@ -168,9 +178,10 @@ while ($more eq 'true')
     my($in) = $_->{incident_number};
     my($iid) = $_->{id};
 
-    if ($_->{first_trigger_log_entry}{channel}{type} eq 'nagios') #ignore if PD incident was not initiated by Nagios
+    if ($_->{first_trigger_log_entry}{channel}{type} eq 'nagios' || $_->{first_trigger_log_entry}{channel}{type} eq 'api') #ignore if PD incident was not initiated by Nagios
     { 
       print "\nPD Incident number: $in\n" if($opts{debug});
+      INFO( "PD Incident number: $in" );
 
       # retrieve the log entries for the incident
       $cmd = "curl -s -H 'Authorization: Token token=$opts{pagerduty_token}' ".
@@ -183,16 +194,19 @@ while ($more eq 'true')
       $skipThisOne = 0;
 
       # skip if this is not a nagios alert
-      $skipThisOne ||= !($ls->{log_entries}[$#{$ls->{log_entries}}]{channel}{type} eq 'nagios');
+      $skipThisOne ||= !($ls->{log_entries}[$#{$ls->{log_entries}}]{channel}{type} eq 'nagios' || $ls->{log_entries}[$#{$ls->{log_entries}}]{channel}{type} eq 'api');
+      INFO( "Skipping - not a nagios alert" ) if($skipThisOne);
 
       # filter out non-ack/resolve
       my($lf) = [grep {$_->{type} =~ /^(resolve_log_entry|acknowledge_log_entry)/} @{$ls->{log_entries}}];
       
       # skip if nagios ack/resolution came from nagios
       $skipThisOne ||= ($lf->[0]{channel}{type} eq 'nagios');
+      INFO( "Skipping - ack/resolution came from nagios" ) if($skipThisOne);
 
       # skip if resolution was a timeout
       $skipThisOne ||= ($lf->[0]{channel}{type} eq 'timeout');
+      INFO( "Skipping - resolution was a timeout" ) if($skipThisOne);
 
       if (!($skipThisOne))
       {
@@ -229,16 +243,19 @@ while ($more eq 'true')
         print " host problem id from Nagios:    '$nagstat->{$h}{HOST}'\n" if($opts{debug});
         print " host problem id from PagerDuty: '$hpi'\n" if($opts{debug});
 
+        INFO( "Hostname:'$raw->{log_entry}{channel}{details}{HOSTNAME}', ServiceDesciption:'$raw->{log_entry}{channel}{details}{SERVICEDESC}', HostProblemId:'$raw->{log_entry}{channel}{details}{HOSTPROBLEMID}', ServiceProblemId:'$raw->{log_entry}{channel}{details}{SERVICEPROBLEMID}'" );
         # first check for any host problems
         if($nagstat->{$h}{HOST} && ($nagstat->{$h}{HOST} <= $hpi)){
           my($t) = time;
           #ACKNOWLEDGE_HOST_PROBLEM;<host_name>;<sticky>;<notify>;<persistent>;<author>;<comment>
           $cmd = "echo '[$t] ACKNOWLEDGE_HOST_PROBLEM;$h;1;0;1;$u;pd event $in $lt by $u via $c' >$opts{nagios_command_pipe}";
           print "Sending Host Acknowledge command to Nagios:\n$cmd\n" if($opts{debug});
+          INFO( "Sending Service Acknowledge command to Nagios:$cmd" );
           # call the command line executable to acknowledge in Nagios
           `$cmd`;
         } else {
           print "No UNACK'D Host problem found in Nagios on host '$h'\n" if($opts{debug});
+          INFO( "No UNACK'D Host problem found in Nagios on host '$h'" );
         }
         print "\nLook for UNACK'D Nagios problem on that host and service:\n" if($opts{debug});
         print " service problem id from Nagios:    '$nagstat->{$h}{$s}'\n" if($opts{debug});
@@ -250,16 +267,19 @@ while ($more eq 'true')
           #ACKNOWLEDGE_SVC_PROBLEM;<host_name>;<service_description>;<sticky>;<notify>;<persistent>;<author>;<comment>
           $cmd = "echo '[$t] ACKNOWLEDGE_SVC_PROBLEM;$h;$s;1;0;1;$u;pd event $in $lt by $u via $c' >$opts{nagios_command_pipe}";
           print "Sending Service Acknowledge command to Nagios:\n$cmd\n" if($opts{debug});
+          INFO( "Sending Service Acknowledge command to Nagios:$cmd" );
           # call the command line executable to acknowledge in Nagios
           `$cmd`;
         } else {
           print "No UNACK'D Service problem found in Nagios on host '$h' and service '$s'\n" if($opts{debug});
+          INFO( "No UNACK'D Service problem found in Nagios on host '$h' and service '$s'" );
         }
       }
     }
     else
     {
       print "Skipping PD incident $in\n" if($opts{debug});
+      INFO( "Skipping PD incident $in" );
     }
   }
 }
