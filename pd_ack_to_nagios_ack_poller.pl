@@ -43,6 +43,10 @@ use Log::Log4perl qw(:easy);
 
 Log::Log4perl->easy_init(
         {
+        level => $DEBUG,
+        file  => ">> debug_log",
+        },
+        {
         level => $INFO,
         file => ">> info_log",
         }
@@ -61,6 +65,7 @@ my(@opts)=('debug',
 die unless GetOptions(\%opts,@opts);
 
 if($opts{help}){
+  INFO( "Showed Help: $opts{help}" );
   print <<EOT;
 $0: pass pagerduty acknowledgements into nagios
 
@@ -87,7 +92,7 @@ die "hours back must be an integer greater than zero" unless(looks_like_number($
 
 my($hours_back) = int($opts{hours_back});
 
-INFO("Options: -s =>$opts{nagios_status_file}, -c => $opts{nagios_command_pipe}, -n $opts{pagerduty_service}, -t => $opts{hours_back}");
+DEBUG("Options: -s =>$opts{nagios_status_file}, -c => $opts{nagios_command_pipe}, -n $opts{pagerduty_service}, -t => $opts{hours_back}") if($opts{debug});
 
 # optionally specify service id(s)
 my($svcparam) = "";
@@ -95,13 +100,12 @@ if(defined($opts{pagerduty_service})){
     $svcparam = "&service_ids%5B%5D=$opts{pagerduty_service}";
 }
 
-my($cmd);
-
+my($cmd,$hasissues);
 print "Retrieve all services with problems from the Nagios status file\n" if($opts{debug});
 # retrieve all services with problems from the Nagios status file
 my($nagstat) = {};
-$cmd = "cat $opts{nagios_status_file} | grep -A50 'servicestatus {'" .
-    "| egrep 'servicestatus|host_name|service_description|current_problem_id|problem_has_been_acknowledged' " .
+$cmd = "cat $opts{nagios_status_file} | grep -A54 'servicestatus {'" .
+    "| egrep 'servicestatus|host_name|service_description|current_problem_id|problem_has_been_acknowledged|scheduled_downtime_depth' " .
     "| cut -d= -f2";
 print "$cmd\n" if($opts{debug});
 my(@statcat) = `$cmd`;
@@ -110,7 +114,8 @@ print "@statcat\n" if($opts{debug});
 # build a map with key hostname-service and the Nagios problem id
 print "Unack'd Nagios Services:\n" if($opts{debug});
 while(@statcat){
-  chomp(my(undef, $h, $s, $pi, $a) = (shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat)));
+  chomp(my(undef, $h, $s, $pi, $a, $sd) = (shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat)));
+  next if($sd > 0);
   next if($a != 0);
   next if($pi == 0);
   print "Host:           $h\n" if($opts{debug});
@@ -118,13 +123,14 @@ while(@statcat){
   print "Problem ID:     $pi\n" if($opts{debug});
   print "Ack'd? (0=not): $a\n" if($opts{debug});
   $nagstat->{$h}{$s} = $pi;
+  $hasissues = "true";
 }
 print "----------------\n" if($opts{debug});
 
 print "Retrieve all hosts with problems from the Nagios status file\n" if($opts{debug});
 # retrieve all hosts with problems from the Nagios status file
-$cmd = "cat $opts{nagios_status_file} | grep -A50 'hoststatus {'" .
-    "| egrep 'host_name|current_problem_id|problem_has_been_acknowledged' " .
+$cmd = "cat $opts{nagios_status_file} | grep -A54 'hoststatus {'" .
+    "| egrep 'host_name|current_problem_id|problem_has_been_acknowledged|scheduled_downtime_depth' " .
     "| cut -d= -f2";
 print "$cmd\n" if($opts{debug});
 my(@statcat) = `$cmd`;
@@ -133,18 +139,23 @@ print "@statcat\n" if($opts{debug});
 # build a map with key hostname-HOST and the Nagios problem id
 print "Unack'd Nagios Hosts:\n" if($opts{debug});
 while(@statcat){
-  chomp(my($h, $pi, $a) = (shift(@statcat), shift(@statcat), shift(@statcat)));
+  chomp(my($h, $pi, $a, $sd) = (shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat)));
+  next if($sd > 0);
   next if($a != 0);
   next if($pi == 0);
   print "Host:           $h\n" if($opts{debug});
   print "Problem ID:     $pi\n" if($opts{debug});
   print "Ack'd? (0=not): $a\n" if($opts{debug});
   $nagstat->{$h}{HOST} = $pi;
+  $hasissues = "true";
 }
 print "----------------\n" if($opts{debug});
 print "All Nagios Hosts and Services with issues and issue number:\n" if($opts{debug});
 print Dumper $nagstat if($opts{debug});
 print "----------------\n\n" if($opts{debug});
+
+DEBUG( "All Nagios Hosts and Services with issues and issue number - nagstat:" ) if($opts{debug});
+DEBUG( Dumper $nagstat ) if($opts{debug});
 
 my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = gmtime(time - (3600 * $hours_back));
 $mon += 1;
@@ -154,9 +165,8 @@ my($dateforquery) = sprintf("%04d-%02d-%02dT%02d:%02d:%02dZ", $year, $mon, $mday
 # retrieve all resolved and acknowledged incidents from pagerduty in reverse order by id
 my($limit,$offset,$more);
 $limit = 100;
-$more = 'true';
+$more = $hasissues;
 $offset = 0;
-
 
 my($j);
 while ($more eq 'true')
@@ -166,6 +176,7 @@ while ($more eq 'true')
       "${svcparam}&statuses%5B%5D=acknowledged&statuses%5B%5D=resolved&since=$dateforquery&sort_by=incident_number:desc" .
       "&include%5B%5D=first_trigger_log_entries'";
   print "PD API Command to get Incidents:\n$cmd\n" if($opts{debug});
+  DEBUG( "PD API Command to get Incidents:$cmd" ) if($opts{debug});
   $j = scalar(`$cmd`);
   my($i) = from_json($j, {allow_nonref=>1});
   $more = $i->{more};
@@ -179,7 +190,7 @@ while ($more eq 'true')
     my($iid) = $_->{id};
 
     if ($_->{first_trigger_log_entry}{channel}{type} eq 'nagios' || $_->{first_trigger_log_entry}{channel}{type} eq 'api') #ignore if PD incident was not initiated by Nagios
-    { 
+    {
       print "\nPD Incident number: $in\n" if($opts{debug});
       INFO( "PD Incident number: $in" );
 
@@ -191,6 +202,8 @@ while ($more eq 'true')
       my($ls) = from_json($j, {allow_nonref=>1});
       print Dumper $ls if($opts{debug});
 
+      DEBUG(Dumper $ls) if($opts{debug});
+
       $skipThisOne = 0;
 
       # skip if this is not a nagios alert
@@ -199,7 +212,8 @@ while ($more eq 'true')
 
       # filter out non-ack/resolve
       my($lf) = [grep {$_->{type} =~ /^(resolve_log_entry|acknowledge_log_entry)/} @{$ls->{log_entries}}];
-      
+      DEBUG( $lf ) if($opts{debug});
+
       # skip if nagios ack/resolution came from nagios
       $skipThisOne ||= ($lf->[0]{channel}{type} eq 'nagios');
       INFO( "Skipping - ack/resolution came from nagios" ) if($skipThisOne);
@@ -211,7 +225,6 @@ while ($more eq 'true')
       if (!($skipThisOne))
       {
         my($u) = $lf->[0]{agent}{summary};
-        # my($u) = $lf->[0]{agent}{email} =~ /^([^\@]*)\@/;
         my($c) = $lf->[0]{channel}{type};
         my($lt) = $lf->[0]{type};
         my($li) = $ls->{log_entries}[$#{$ls->{log_entries}}]{id};
@@ -220,18 +233,24 @@ while ($more eq 'true')
         $cmd = "curl -s -H 'Authorization: Token token=$opts{pagerduty_token}' " .
             "'https://api.pagerduty.com/log_entries/$li?include%5B%5D=channels'";
         print "PD API Command to get custom fields from log_entries:\n$cmd\n" if($opts{debug});
+        DEBUG( "Get Custom fields: '$cmd'" ) if($opts{debug});
 
         $j = scalar(`$cmd`);
         my($raw) = from_json($j, {allow_nonref=>1});
         print Dumper $raw->{log_entry}{channel}{details} if($opts{debug});
 
+        DEBUG( "j: $j" ) if($opts{debug} );
+        DEBUG( "raw: $raw" ) if($opts{debug} );
+        DEBUG( "{log_entry}{channel}{details}:" ) if($opts{debug});
+        DEBUG( Dumper $raw->{log_entry}{channel}{details} ) if($opts{debug});
+
         # get the HOST and SERVICE info
         my($h) = $raw->{log_entry}{channel}{details}{HOSTNAME};
-        #my($h) = $raw->{log_entry}{channel}{details}{HOSTDISPLAYNAME};
         my($s) = $raw->{log_entry}{channel}{details}{SERVICEDESC};
-        #my($s) = $raw->{log_entry}{channel}{details}{SERVICEDISPLAYNAME};
         my($hpi) = $raw->{log_entry}{channel}{details}{HOSTPROBLEMID};
         my($spi) = $raw->{log_entry}{channel}{details}{SERVICEPROBLEMID};
+
+        DEBUG( "Hostname:'$h', ServiceDesciption:'$s', Problem IDs - Nagios host:'$nagstat->{$h}{HOST}', Nagios service:'$nagstat->{$h}{$s}', PD host:'$hpi', PD service:'$spi'" ) if($opts{debug});
 
         # skip if there's no problem id in nagios (meaning service is
         # already recovered), or if the problem id is more recent than
@@ -239,13 +258,13 @@ while ($more eq 'true')
         print "Custom Detail Fields found in PD Incident:\n" if($opts{debug});
         print " host name:    '$h'\n" if($opts{debug});
         print " service name: '$s'\n" if($opts{debug});
+
+        # first check for any host problems
         print "\nLook for UNACK'D Nagios problem on that host:\n" if($opts{debug});
         print " host problem id from Nagios:    '$nagstat->{$h}{HOST}'\n" if($opts{debug});
         print " host problem id from PagerDuty: '$hpi'\n" if($opts{debug});
 
-        INFO( "Hostname:'$raw->{log_entry}{channel}{details}{HOSTNAME}', ServiceDesciption:'$raw->{log_entry}{channel}{details}{SERVICEDESC}', HostProblemId:'$raw->{log_entry}{channel}{details}{HOSTPROBLEMID}', ServiceProblemId:'$raw->{log_entry}{channel}{details}{SERVICEPROBLEMID}'" );
-        # first check for any host problems
-        if($nagstat->{$h}{HOST} && ($nagstat->{$h}{HOST} <= $hpi)){
+        if($nagstat->{$h}{HOST}){
           my($t) = time;
           #ACKNOWLEDGE_HOST_PROBLEM;<host_name>;<sticky>;<notify>;<persistent>;<author>;<comment>
           $cmd = "echo '[$t] ACKNOWLEDGE_HOST_PROBLEM;$h;1;0;1;$u;pd event $in $lt by $u via $c' >$opts{nagios_command_pipe}";
@@ -257,12 +276,13 @@ while ($more eq 'true')
           print "No UNACK'D Host problem found in Nagios on host '$h'\n" if($opts{debug});
           INFO( "No UNACK'D Host problem found in Nagios on host '$h'" );
         }
+
+        # then check for any service problems
         print "\nLook for UNACK'D Nagios problem on that host and service:\n" if($opts{debug});
         print " service problem id from Nagios:    '$nagstat->{$h}{$s}'\n" if($opts{debug});
         print " service problem id from PagerDuty: '$spi'\n" if($opts{debug});
 
-        # then check for any service problems
-        if($nagstat->{$h}{$s} && ($nagstat->{$h}{$s} <= $spi)){
+        if($nagstat->{$h}{$s}){
           my($t) = time;
           #ACKNOWLEDGE_SVC_PROBLEM;<host_name>;<service_description>;<sticky>;<notify>;<persistent>;<author>;<comment>
           $cmd = "echo '[$t] ACKNOWLEDGE_SVC_PROBLEM;$h;$s;1;0;1;$u;pd event $in $lt by $u via $c' >$opts{nagios_command_pipe}";
@@ -272,7 +292,7 @@ while ($more eq 'true')
           `$cmd`;
         } else {
           print "No UNACK'D Service problem found in Nagios on host '$h' and service '$s'\n" if($opts{debug});
-          INFO( "No UNACK'D Service problem found in Nagios on host '$h' and service '$s'" );
+          INFO( "No UNACK'D Service problem found in Nagios on host '$h' and service '$s" );
         }
       }
     }
